@@ -346,7 +346,7 @@ def main():
     parser.add_argument(
         '--datasets',
         nargs='+',
-        default=['fb_348', 'fb_414', 'fb_686', 'fb_698', 'mag_cs'],
+        default=['fb_348', 'fb_414', 'fb_686', 'fb_698', 'fb_1684', 'fb_1912', 'mag_cs', 'mag_chem'],
         choices=sorted(DATASETS.keys()),
     )
     parser.add_argument(
