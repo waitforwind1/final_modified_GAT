@@ -293,6 +293,9 @@ class HybridGateGATLayer(MessagePassing):
         add_self_loops=True,
         init_beta_struct=1.0,
         init_beta_feat=1.0,
+        init_beta_agree=0.0,
+        init_beta_edge=0.0,
+        init_beta_trust=0.0,
         gate_activation='identity',
         use_channel_mix=True,
         prop_gate_strength=2.0,
@@ -309,6 +312,9 @@ class HybridGateGATLayer(MessagePassing):
         self.add_self_loops = add_self_loops
         self.init_beta_struct = init_beta_struct
         self.init_beta_feat = init_beta_feat
+        self.init_beta_agree = init_beta_agree
+        self.init_beta_edge = init_beta_edge
+        self.init_beta_trust = init_beta_trust
         self.gate_activation = gate_activation
         self.use_channel_mix = use_channel_mix
         self.prop_gate_strength = prop_gate_strength
@@ -317,12 +323,18 @@ class HybridGateGATLayer(MessagePassing):
         self.enable_propagation_gate = enable_propagation_gate
 
         self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+        self.node_trust_lin = nn.Linear(struct_dim, 1, bias=True)
+        self.edge_mlp_lin1 = nn.Linear(4, 8, bias=True)
+        self.edge_mlp_lin2 = nn.Linear(8, 1, bias=True)
         self.att_src = nn.Parameter(torch.Tensor(1, heads, out_channels))
         self.att_dst = nn.Parameter(torch.Tensor(1, heads, out_channels))
         self.bias = nn.Parameter(torch.Tensor(out_channels))
 
         self.beta_struct = nn.Parameter(torch.tensor(1.0))
         self.beta_feat = nn.Parameter(torch.tensor(1.0))
+        self.beta_agree = nn.Parameter(torch.tensor(0.0))
+        self.beta_edge = nn.Parameter(torch.tensor(0.0))
+        self.beta_trust = nn.Parameter(torch.tensor(0.0))
         self.beta_centrality = nn.Parameter(torch.tensor(1.0))
         self.cue_mix = nn.Parameter(torch.Tensor(heads, 4))
         self.cue_bias = nn.Parameter(torch.zeros(heads))
@@ -336,12 +348,21 @@ class HybridGateGATLayer(MessagePassing):
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.lin.weight)
+        nn.init.zeros_(self.node_trust_lin.weight)
+        nn.init.zeros_(self.node_trust_lin.bias)
+        nn.init.xavier_uniform_(self.edge_mlp_lin1.weight)
+        nn.init.zeros_(self.edge_mlp_lin1.bias)
+        nn.init.zeros_(self.edge_mlp_lin2.weight)
+        nn.init.zeros_(self.edge_mlp_lin2.bias)
         nn.init.xavier_uniform_(self.att_src)
         nn.init.xavier_uniform_(self.att_dst)
         nn.init.zeros_(self.bias)
         with torch.no_grad():
             self.beta_struct.fill_(self.init_beta_struct)
             self.beta_feat.fill_(self.init_beta_feat)
+            self.beta_agree.fill_(self.init_beta_agree)
+            self.beta_edge.fill_(self.init_beta_edge)
+            self.beta_trust.fill_(self.init_beta_trust)
             self.beta_centrality.fill_(1.0)
             self.residual_gate_scale.fill_(0.5)
         nn.init.xavier_uniform_(self.cue_mix)
@@ -361,6 +382,7 @@ class HybridGateGATLayer(MessagePassing):
 
     def forward(self, x, edge_index, struct_feat, return_attention_weights=False):
         x = self.lin(x).view(-1, self.heads, self.out_channels)
+        node_trust = torch.sigmoid(self.node_trust_lin(struct_feat)).squeeze(-1)
 
         alpha_src = (x * self.att_src).sum(dim=-1)
         alpha_dst = (x * self.att_dst).sum(dim=-1)
@@ -370,7 +392,8 @@ class HybridGateGATLayer(MessagePassing):
             alpha_src=alpha_src,
             alpha_dst=alpha_dst,
             x=x,
-            struct_feat=struct_feat
+            struct_feat=struct_feat,
+            node_trust=node_trust,
         )
 
         out = self.propagate(edge_index, x=x, alpha=alpha)
@@ -380,7 +403,20 @@ class HybridGateGATLayer(MessagePassing):
             return out, (edge_index, alpha, prop_alpha)
         return out
 
-    def edge_update(self, alpha_src_j, alpha_dst_i, x_j, x_i, struct_feat_j, struct_feat_i, index, ptr, size_i):
+    def edge_update(
+        self,
+        alpha_src_j,
+        alpha_dst_i,
+        x_j,
+        x_i,
+        struct_feat_j,
+        struct_feat_i,
+        node_trust_j,
+        node_trust_i,
+        index,
+        ptr,
+        size_i,
+    ):
         alpha_raw = F.leaky_relu(alpha_src_j + alpha_dst_i, negative_slope=0.2)
 
         struct_sim = F.cosine_similarity(struct_feat_j, struct_feat_i, dim=-1, eps=1e-8)
@@ -390,11 +426,22 @@ class HybridGateGATLayer(MessagePassing):
             dim=-1,
             eps=1e-8
         )
+        agreement = struct_sim * feat_sim
+        conflict = torch.abs(struct_sim - feat_sim)
+        edge_cues = torch.stack([struct_sim, feat_sim, agreement, conflict], dim=-1)
+        edge_gate = self.edge_mlp_lin2(F.relu(self.edge_mlp_lin1(edge_cues))).squeeze(-1)
+        edge_bonus = torch.sigmoid(edge_gate) * F.relu(agreement)
+        edge_trust = torch.sqrt(torch.clamp(node_trust_j * node_trust_i, min=0.0))
+        trust_bonus = edge_trust * F.relu(0.5 * (struct_sim + feat_sim))
         # The last two structural channels are global centrality-style priors.
-        centrality_j = struct_feat_j[:, -2:]
-        centrality_i = struct_feat_i[:, -2:]
-        centrality_sim = F.cosine_similarity(centrality_j, centrality_i, dim=-1, eps=1e-8)
-        centrality_gap = -torch.mean(torch.abs(centrality_j - centrality_i), dim=-1)
+        if struct_feat_j.size(-1) >= 2:
+            centrality_j = struct_feat_j[:, -2:]
+            centrality_i = struct_feat_i[:, -2:]
+            centrality_sim = F.cosine_similarity(centrality_j, centrality_i, dim=-1, eps=1e-8)
+            centrality_gap = -torch.mean(torch.abs(centrality_j - centrality_i), dim=-1)
+        else:
+            centrality_sim = torch.zeros_like(struct_sim)
+            centrality_gap = torch.zeros_like(struct_sim)
 
         if self.enable_residual_gate:
             if self.use_channel_mix:
@@ -418,14 +465,20 @@ class HybridGateGATLayer(MessagePassing):
 
                 # Keep the gate as a bounded residual correction to stabilize cross-dataset behavior.
                 gate_logit = torch.tanh(gate_logit) * torch.sigmoid(self.residual_gate_scale)
+            gate_logit = gate_logit + self._activate_gate(self.beta_agree) * agreement.unsqueeze(-1)
+            gate_logit = gate_logit + self._activate_gate(self.beta_edge) * edge_bonus.unsqueeze(-1)
+            gate_logit = gate_logit + self._activate_gate(self.beta_trust) * trust_bonus.unsqueeze(-1)
             alpha_raw = alpha_raw + gate_logit
 
         if self.enable_propagation_gate:
             prop_support = (
-                0.35 * struct_sim
-                + 0.35 * feat_sim
-                + 0.20 * centrality_sim
-                + 0.10 * (1.0 + centrality_gap)
+                0.25 * struct_sim
+                + 0.25 * feat_sim
+                + 0.15 * agreement
+                + 0.10 * edge_bonus
+                + 0.10 * trust_bonus
+                + 0.10 * centrality_sim
+                + 0.05 * (1.0 + centrality_gap)
             )
             prop_gate = torch.sigmoid(self.prop_gate_strength * (prop_support - self.prop_gate_bias))
             prop_alpha_raw = alpha_raw + torch.log(prop_gate.unsqueeze(-1).clamp_min(1e-8))
@@ -441,6 +494,323 @@ class HybridGateGATLayer(MessagePassing):
         return x_j * alpha.unsqueeze(-1)
 
 
+class GateReproGATLayer(MessagePassing):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        struct_dim,
+        heads=6,
+        dropout=0.0,
+        init_beta_struct=1.15,
+        init_beta_feat=0.85,
+        init_beta_agree=0.10,
+        init_beta_edge=0.08,
+        init_beta_trust=0.12,
+        main_beta_agree_scale=1.0,
+        main_beta_edge_scale=1.0,
+        main_beta_trust_scale=1.0,
+        prop_gate_strength=2.0,
+        prop_gate_bias=0.15,
+        prop_gate_struct_weight=0.30,
+        prop_gate_feat_weight=0.30,
+        prop_gate_agree_weight=0.20,
+        prop_gate_edge_weight=0.10,
+        prop_gate_trust_weight=0.10,
+        graph_clust_gate_scale=0.0,
+        prop_graph_clust_gate_scale=0.0,
+        enable_propagation_gate=True,
+    ):
+        super().__init__(node_dim=0, aggr='add')
+        self.out_channels = out_channels
+        self.heads = heads
+        self.dropout = dropout
+        self.prop_gate_strength = prop_gate_strength
+        self.prop_gate_bias = prop_gate_bias
+        self.prop_gate_struct_weight = prop_gate_struct_weight
+        self.prop_gate_feat_weight = prop_gate_feat_weight
+        self.prop_gate_agree_weight = prop_gate_agree_weight
+        self.prop_gate_edge_weight = prop_gate_edge_weight
+        self.prop_gate_trust_weight = prop_gate_trust_weight
+        self.graph_clust_gate_scale = graph_clust_gate_scale
+        self.prop_graph_clust_gate_scale = prop_graph_clust_gate_scale
+        self.enable_propagation_gate = enable_propagation_gate
+        self._graph_gate_scale = None
+        self._prop_graph_gate_scale = None
+
+        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+        self.node_trust_lin = nn.Linear(struct_dim, 1, bias=True)
+        self.edge_mlp_lin1 = nn.Linear(4, 8, bias=True)
+        self.edge_mlp_lin2 = nn.Linear(8, 1, bias=True)
+        self.att_src = nn.Parameter(torch.Tensor(1, heads, out_channels))
+        self.att_dst = nn.Parameter(torch.Tensor(1, heads, out_channels))
+        self.bias = nn.Parameter(torch.Tensor(out_channels))
+
+        self.beta_struct = nn.Parameter(torch.tensor(init_beta_struct))
+        self.beta_feat = nn.Parameter(torch.tensor(init_beta_feat))
+        self.beta_agree = nn.Parameter(torch.tensor(init_beta_agree))
+        self.beta_edge = nn.Parameter(torch.tensor(init_beta_edge))
+        self.beta_trust = nn.Parameter(torch.tensor(init_beta_trust))
+        self.main_beta_agree_scale = main_beta_agree_scale
+        self.main_beta_edge_scale = main_beta_edge_scale
+        self.main_beta_trust_scale = main_beta_trust_scale
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.lin.weight)
+        nn.init.zeros_(self.node_trust_lin.weight)
+        nn.init.zeros_(self.node_trust_lin.bias)
+        nn.init.xavier_uniform_(self.edge_mlp_lin1.weight)
+        nn.init.zeros_(self.edge_mlp_lin1.bias)
+        nn.init.zeros_(self.edge_mlp_lin2.weight)
+        nn.init.zeros_(self.edge_mlp_lin2.bias)
+        nn.init.xavier_uniform_(self.att_src)
+        nn.init.xavier_uniform_(self.att_dst)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x, edge_index, struct_feat, return_attention_weights=False):
+        x = self.lin(x).view(-1, self.heads, self.out_channels)
+        node_trust = torch.sigmoid(self.node_trust_lin(struct_feat)).squeeze(-1)
+        if struct_feat.size(1) > 1:
+            graph_clustering = torch.clamp(struct_feat[:, 1:2].mean(), 0.0, 1.0)
+            graph_gate_scale = 1.0 - self.graph_clust_gate_scale * (graph_clustering - 0.5)
+            self._graph_gate_scale = torch.clamp(graph_gate_scale, 0.7, 1.3)
+            prop_graph_gate_scale = 1.0 - self.prop_graph_clust_gate_scale * (graph_clustering - 0.5)
+            self._prop_graph_gate_scale = torch.clamp(prop_graph_gate_scale, 0.7, 1.3)
+        else:
+            self._graph_gate_scale = x.new_tensor(1.0)
+            self._prop_graph_gate_scale = x.new_tensor(1.0)
+
+        alpha, prop_alpha = self.edge_updater(
+            edge_index,
+            alpha_src=(x * self.att_src).sum(dim=-1),
+            alpha_dst=(x * self.att_dst).sum(dim=-1),
+            x=x,
+            struct_feat=struct_feat,
+            node_trust=node_trust,
+        )
+
+        out = self.propagate(edge_index, x=x, alpha=alpha)
+        out = out.mean(dim=1)
+        out = out + self.bias
+        self._graph_gate_scale = None
+        self._prop_graph_gate_scale = None
+        if return_attention_weights:
+            return out, (edge_index, alpha, prop_alpha)
+        return out
+
+    def edge_update(
+        self,
+        alpha_src_j,
+        alpha_dst_i,
+        x_j,
+        x_i,
+        struct_feat_j,
+        struct_feat_i,
+        node_trust_j,
+        node_trust_i,
+        index,
+        ptr,
+        size_i,
+    ):
+        alpha_raw = F.leaky_relu(alpha_src_j + alpha_dst_i, negative_slope=0.2)
+        struct_sim = F.cosine_similarity(struct_feat_j, struct_feat_i, dim=-1, eps=1e-8)
+        feat_sim = F.cosine_similarity(
+            x_j.reshape(x_j.size(0), -1),
+            x_i.reshape(x_i.size(0), -1),
+            dim=-1,
+            eps=1e-8,
+        )
+        agreement = struct_sim * feat_sim
+        conflict = torch.abs(struct_sim - feat_sim)
+        edge_cues = torch.stack([struct_sim, feat_sim, agreement, conflict], dim=-1)
+        edge_gate = self.edge_mlp_lin2(F.relu(self.edge_mlp_lin1(edge_cues))).squeeze(-1)
+        edge_bonus = torch.sigmoid(edge_gate) * F.relu(agreement)
+        edge_trust = torch.sqrt(torch.clamp(node_trust_j * node_trust_i, min=0.0))
+        trust_bonus = edge_trust * F.relu(0.5 * (struct_sim + feat_sim))
+        base_gate_logit = (
+            self.beta_struct * struct_sim
+            + self.beta_feat * feat_sim
+            + self.beta_agree * agreement
+            + self.beta_edge * edge_bonus
+            + self.beta_trust * trust_bonus
+        )
+        alpha_gate_logit = (
+            self.beta_struct * struct_sim
+            + self.beta_feat * feat_sim
+            + (self.beta_agree * self.main_beta_agree_scale * self._graph_gate_scale) * agreement
+            + (self.beta_edge * self.main_beta_edge_scale * self._graph_gate_scale) * edge_bonus
+            + (self.beta_trust * self.main_beta_trust_scale * self._graph_gate_scale) * trust_bonus
+        )
+        base_alpha_raw = alpha_raw + alpha_gate_logit.unsqueeze(-1)
+        if self.enable_propagation_gate:
+            prop_support = (
+                self.prop_gate_struct_weight * struct_sim
+                + self.prop_gate_feat_weight * feat_sim
+                + (self.prop_gate_agree_weight * self._prop_graph_gate_scale) * agreement
+                + (self.prop_gate_edge_weight * self._prop_graph_gate_scale) * edge_bonus
+                + (self.prop_gate_trust_weight * self._prop_graph_gate_scale) * trust_bonus
+            )
+            prop_gate = torch.sigmoid(self.prop_gate_strength * (prop_support - self.prop_gate_bias))
+            prop_alpha_raw = alpha_raw + base_gate_logit.unsqueeze(-1) + torch.log(prop_gate.unsqueeze(-1).clamp_min(1e-8))
+        else:
+            prop_alpha_raw = alpha_raw + base_gate_logit.unsqueeze(-1)
+        alpha = softmax(base_alpha_raw, index, ptr, size_i)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        prop_alpha = softmax(prop_alpha_raw, index, ptr, size_i)
+        return alpha, prop_alpha
+
+    def message(self, x_j, alpha):
+        return x_j * alpha.unsqueeze(-1)
+
+
+class GateReproResidualGATLayer(MessagePassing):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        struct_dim,
+        heads=6,
+        dropout=0.0,
+        init_beta_struct=1.15,
+        init_beta_feat=0.85,
+        init_beta_agree=0.10,
+        init_beta_edge=0.08,
+        init_beta_trust=0.12,
+        init_beta_residual=0.15,
+        init_residual_bias=-2.0,
+        init_beta_attn_residual=0.05,
+    ):
+        super().__init__(node_dim=0, aggr='add')
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.heads = heads
+        self.dropout = dropout
+        self.init_beta_residual = init_beta_residual
+        self.init_residual_bias = init_residual_bias
+        self.init_beta_attn_residual = init_beta_attn_residual
+
+        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+        self.node_trust_lin = nn.Linear(struct_dim, 1, bias=True)
+        self.residual_lin = nn.Linear(in_channels, out_channels, bias=False)
+        self.residual_gate_lin = nn.Linear(struct_dim, 1, bias=True)
+        self.attn_residual_lin = nn.Linear(struct_dim, 1, bias=True)
+        self.edge_mlp_lin1 = nn.Linear(4, 8, bias=True)
+        self.edge_mlp_lin2 = nn.Linear(8, 1, bias=True)
+        self.att_src = nn.Parameter(torch.Tensor(1, heads, out_channels))
+        self.att_dst = nn.Parameter(torch.Tensor(1, heads, out_channels))
+        self.bias = nn.Parameter(torch.Tensor(out_channels))
+
+        self.beta_struct = nn.Parameter(torch.tensor(init_beta_struct))
+        self.beta_feat = nn.Parameter(torch.tensor(init_beta_feat))
+        self.beta_agree = nn.Parameter(torch.tensor(init_beta_agree))
+        self.beta_edge = nn.Parameter(torch.tensor(init_beta_edge))
+        self.beta_trust = nn.Parameter(torch.tensor(init_beta_trust))
+        self.beta_residual = nn.Parameter(torch.tensor(init_beta_residual))
+        self.beta_attn_residual = nn.Parameter(torch.tensor(init_beta_attn_residual))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.lin.weight)
+        nn.init.zeros_(self.node_trust_lin.weight)
+        nn.init.zeros_(self.node_trust_lin.bias)
+        nn.init.xavier_uniform_(self.residual_lin.weight)
+        nn.init.zeros_(self.residual_gate_lin.weight)
+        nn.init.zeros_(self.residual_gate_lin.bias)
+        nn.init.zeros_(self.attn_residual_lin.weight)
+        nn.init.zeros_(self.attn_residual_lin.bias)
+        nn.init.xavier_uniform_(self.edge_mlp_lin1.weight)
+        nn.init.zeros_(self.edge_mlp_lin1.bias)
+        nn.init.zeros_(self.edge_mlp_lin2.weight)
+        nn.init.zeros_(self.edge_mlp_lin2.bias)
+        nn.init.xavier_uniform_(self.att_src)
+        nn.init.xavier_uniform_(self.att_dst)
+        nn.init.zeros_(self.bias)
+        with torch.no_grad():
+            self.beta_residual.fill_(self.init_beta_residual)
+            self.residual_gate_lin.bias.fill_(self.init_residual_bias)
+            self.beta_attn_residual.fill_(self.init_beta_attn_residual)
+
+    def forward(self, x, edge_index, struct_feat, return_attention_weights=False):
+        residual = self.residual_lin(x)
+        residual_gate = torch.sigmoid(self.residual_gate_lin(struct_feat))
+        x = self.lin(x).view(-1, self.heads, self.out_channels)
+        node_trust = torch.sigmoid(self.node_trust_lin(struct_feat)).squeeze(-1)
+
+        alpha = self.edge_updater(
+            edge_index,
+            alpha_src=(x * self.att_src).sum(dim=-1),
+            alpha_dst=(x * self.att_dst).sum(dim=-1),
+            x=x,
+            struct_feat=struct_feat,
+            node_trust=node_trust,
+        )
+
+        out = self.propagate(edge_index, x=x, alpha=alpha)
+        out = out.mean(dim=1)
+        out = out + self.beta_residual * residual_gate * residual
+        out = out + self.bias
+        if return_attention_weights:
+            return out, (edge_index, alpha, alpha)
+        return out
+
+    def edge_update(
+        self,
+        alpha_src_j,
+        alpha_dst_i,
+        x_j,
+        x_i,
+        struct_feat_j,
+        struct_feat_i,
+        node_trust_j,
+        node_trust_i,
+        index,
+        ptr,
+        size_i,
+    ):
+        alpha_raw = F.leaky_relu(alpha_src_j + alpha_dst_i, negative_slope=0.2)
+        struct_sim = F.cosine_similarity(struct_feat_j, struct_feat_i, dim=-1, eps=1e-8)
+        feat_sim = F.cosine_similarity(
+            x_j.reshape(x_j.size(0), -1),
+            x_i.reshape(x_i.size(0), -1),
+            dim=-1,
+            eps=1e-8,
+        )
+        agreement = struct_sim * feat_sim
+        conflict = torch.abs(struct_sim - feat_sim)
+        edge_cues = torch.stack([struct_sim, feat_sim, agreement, conflict], dim=-1)
+        edge_gate = self.edge_mlp_lin2(F.relu(self.edge_mlp_lin1(edge_cues))).squeeze(-1)
+        edge_bonus = torch.sigmoid(edge_gate) * F.relu(agreement)
+        edge_trust = torch.sqrt(torch.clamp(node_trust_j * node_trust_i, min=0.0))
+        trust_bonus = edge_trust * F.relu(0.5 * (struct_sim + feat_sim))
+        attn_residual = 0.5 * (
+            self.attn_residual_lin(struct_feat_j).squeeze(-1)
+            + self.attn_residual_lin(struct_feat_i).squeeze(-1)
+        )
+        gate_logit = (
+            self.beta_struct * struct_sim
+            + self.beta_feat * feat_sim
+            + self.beta_agree * agreement
+            + self.beta_edge * edge_bonus
+            + self.beta_trust * trust_bonus
+        )
+        alpha = softmax(
+            alpha_raw
+            + gate_logit.unsqueeze(-1)
+            + self.beta_attn_residual * attn_residual.unsqueeze(-1),
+            index,
+            ptr,
+            size_i,
+        )
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        return alpha
+
+    def message(self, x_j, alpha):
+        return x_j * alpha.unsqueeze(-1)
+
+
 class GAT(nn.Module):
     def __init__(
         self,
@@ -451,12 +821,31 @@ class GAT(nn.Module):
         dropout=0.5,
         batch_norm=False,
         heads=6,
+        use_gate_repro_gat2=False,
+        use_hybrid_gat2=False,
+        use_gate_repro_residual_gat2=False,
         init_beta_struct=1.0,
         init_beta_feat=1.0,
+        init_beta_agree=0.0,
+        init_beta_edge=0.0,
+        init_beta_trust=0.0,
+        main_beta_agree_scale=1.0,
+        main_beta_edge_scale=1.0,
+        main_beta_trust_scale=1.0,
+        init_beta_residual=0.15,
+        init_residual_bias=-2.0,
+        init_beta_attn_residual=0.05,
         gate_activation='identity',
         use_channel_mix=True,
         prop_gate_strength=2.0,
         prop_gate_bias=0.15,
+        prop_gate_struct_weight=0.30,
+        prop_gate_feat_weight=0.30,
+        prop_gate_agree_weight=0.20,
+        prop_gate_edge_weight=0.10,
+        prop_gate_trust_weight=0.10,
+        graph_clust_gate_scale=0.0,
+        prop_graph_clust_gate_scale=0.0,
         enable_residual_gate=True,
         enable_propagation_gate=True,
         lp_steps=0,
@@ -498,6 +887,11 @@ class GAT(nn.Module):
         lp_sparse_power=1.50,
         lp_sparse_topk=0,
         lp_dual_route_graph_clust_damp=0.0,
+        lp_output_blend_enabled=False,
+        lp_output_blend_base=0.0,
+        lp_output_blend_conf_weight=0.65,
+        lp_output_blend_degree_weight=0.20,
+        lp_output_blend_clust_weight=0.10,
     ):
         super().__init__()
         self.dropout = dropout
@@ -509,6 +903,14 @@ class GAT(nn.Module):
         self.lp_sparse_power = lp_sparse_power
         self.lp_sparse_topk = lp_sparse_topk
         self.lp_dual_route_graph_clust_damp = lp_dual_route_graph_clust_damp
+        self.lp_output_blend_enabled = lp_output_blend_enabled
+        self.lp_output_blend_base = lp_output_blend_base
+        self.lp_output_blend_conf_weight = lp_output_blend_conf_weight
+        self.lp_output_blend_degree_weight = lp_output_blend_degree_weight
+        self.lp_output_blend_clust_weight = lp_output_blend_clust_weight
+        self.use_gate_repro_gat2 = use_gate_repro_gat2
+        self.use_hybrid_gat2 = use_hybrid_gat2
+        self.use_gate_repro_residual_gat2 = use_gate_repro_residual_gat2
 
         hidden_dim = hidden_dims[0]
 
@@ -520,15 +922,76 @@ class GAT(nn.Module):
             concat=False
         )
 
-        # For this ablation, the second GAT layer is kept as the plain paper-style GATConv.
-        self.gat2 = GATConv(
-            hidden_dim,
-            output_dim,
-            heads=heads,
-            add_self_loops=True,
-            concat=False,
-            dropout=dropout,
-        )
+        if self.use_gate_repro_residual_gat2:
+            self.gat2 = GateReproResidualGATLayer(
+                hidden_dim,
+                output_dim,
+                struct_dim=struct_dim,
+                heads=heads,
+                dropout=dropout,
+                init_beta_struct=init_beta_struct,
+                init_beta_feat=init_beta_feat,
+                init_beta_agree=init_beta_agree,
+                init_beta_edge=init_beta_edge,
+                init_beta_trust=init_beta_trust,
+                init_beta_residual=init_beta_residual,
+                init_residual_bias=init_residual_bias,
+                init_beta_attn_residual=init_beta_attn_residual,
+            )
+        elif self.use_gate_repro_gat2:
+            self.gat2 = GateReproGATLayer(
+                hidden_dim,
+                output_dim,
+                struct_dim=struct_dim,
+                heads=heads,
+                dropout=dropout,
+                init_beta_struct=init_beta_struct,
+                init_beta_feat=init_beta_feat,
+                init_beta_agree=init_beta_agree,
+                init_beta_edge=init_beta_edge,
+                init_beta_trust=init_beta_trust,
+                main_beta_agree_scale=main_beta_agree_scale,
+                main_beta_edge_scale=main_beta_edge_scale,
+                main_beta_trust_scale=main_beta_trust_scale,
+                prop_gate_strength=prop_gate_strength,
+                prop_gate_bias=prop_gate_bias,
+                prop_gate_struct_weight=prop_gate_struct_weight,
+                prop_gate_feat_weight=prop_gate_feat_weight,
+                prop_gate_agree_weight=prop_gate_agree_weight,
+                prop_gate_edge_weight=prop_gate_edge_weight,
+                prop_gate_trust_weight=prop_gate_trust_weight,
+                graph_clust_gate_scale=graph_clust_gate_scale,
+                prop_graph_clust_gate_scale=prop_graph_clust_gate_scale,
+                enable_propagation_gate=enable_propagation_gate,
+            )
+        elif self.use_hybrid_gat2:
+            self.gat2 = HybridGateGATLayer(
+                hidden_dim,
+                output_dim,
+                struct_dim=struct_dim,
+                heads=heads,
+                dropout=dropout,
+                init_beta_struct=init_beta_struct,
+                init_beta_feat=init_beta_feat,
+                init_beta_agree=init_beta_agree,
+                init_beta_edge=init_beta_edge,
+                init_beta_trust=init_beta_trust,
+                gate_activation=gate_activation,
+                use_channel_mix=use_channel_mix,
+                prop_gate_strength=prop_gate_strength,
+                prop_gate_bias=prop_gate_bias,
+                enable_residual_gate=enable_residual_gate,
+                enable_propagation_gate=enable_propagation_gate,
+            )
+        else:
+            self.gat2 = GATConv(
+                hidden_dim,
+                output_dim,
+                heads=heads,
+                add_self_loops=True,
+                concat=False,
+                dropout=dropout,
+            )
         self.lp = ConfidenceLabelPropagation(
             prop_steps=lp_steps,
             alpha=lp_alpha,
@@ -728,6 +1191,42 @@ class GAT(nn.Module):
             return adj, sparse_attn_adj, route_bias
         raise ValueError(f'Unsupported lp_mode: {self.lp_mode}')
 
+    def _blend_lp_output(self, pre_lp_out, post_lp_out, struct_feat):
+        if not self.lp_output_blend_enabled:
+            return post_lp_out, None
+
+        pre_lp_score = F.relu(pre_lp_out)
+        post_lp_score = F.relu(post_lp_out)
+        eps = 1e-8
+        score_mass = pre_lp_score.sum(dim=1, keepdim=True)
+        probs = pre_lp_score / (score_mass + eps)
+        if pre_lp_score.size(1) > 1:
+            max_entropy = float(np.log(pre_lp_score.size(1)))
+            entropy = -(probs * torch.log(probs + eps)).sum(dim=1, keepdim=True)
+            confidence = 1.0 - entropy / max_entropy
+        else:
+            confidence = torch.ones_like(score_mass)
+
+        if struct_feat is not None and struct_feat.size(1) > 0:
+            log_degree = struct_feat[:, :1]
+            if struct_feat.size(1) > 1:
+                clustering = struct_feat[:, 1:2]
+            else:
+                clustering = torch.full_like(log_degree, 0.5)
+        else:
+            log_degree = torch.full_like(confidence, 0.5)
+            clustering = torch.full_like(confidence, 0.5)
+
+        lp_mix = (
+            self.lp_output_blend_base
+            + self.lp_output_blend_conf_weight * (1.0 - confidence)
+            + self.lp_output_blend_degree_weight * (1.0 - log_degree)
+            + self.lp_output_blend_clust_weight * (1.0 - clustering)
+        )
+        lp_mix = torch.clamp(lp_mix, 0.0, 1.0)
+        blended = pre_lp_score + lp_mix * (post_lp_score - pre_lp_score)
+        return blended, lp_mix
+
     def forward(self, x, adj, struct_feat):
         out, _ = self.forward_with_aux(x, adj, struct_feat)
         return out
@@ -747,18 +1246,42 @@ class GAT(nn.Module):
         if self.dropout != 0:
             h = sparse_or_dense_dropout(h, p=self.dropout, training=self.training)
 
-        out, (lp_edge_index, lp_alpha) = self.gat2(h, edge_index, return_attention_weights=True)
-        lp_prop_alpha = lp_alpha
+        if self.use_gate_repro_residual_gat2:
+            out, (lp_edge_index, lp_alpha, lp_prop_alpha) = self.gat2(
+                h,
+                edge_index,
+                struct_feat,
+                return_attention_weights=True,
+            )
+        elif self.use_gate_repro_gat2:
+            out, (lp_edge_index, lp_alpha, lp_prop_alpha) = self.gat2(
+                h,
+                edge_index,
+                struct_feat,
+                return_attention_weights=True,
+            )
+        elif self.use_hybrid_gat2:
+            out, (lp_edge_index, lp_alpha, lp_prop_alpha) = self.gat2(
+                h,
+                edge_index,
+                struct_feat,
+                return_attention_weights=True,
+            )
+        else:
+            out, (lp_edge_index, lp_alpha) = self.gat2(h, edge_index, return_attention_weights=True)
+            lp_prop_alpha = lp_alpha
         pre_lp_out = out
         contrastive_embed = self.contrastive_head(out)
         lp_adj = self._resolve_lp_adj(adj, lp_edge_index, lp_prop_alpha, out.size(0), struct_feat)
         out = self.lp(out, lp_adj, struct_feat)
+        out, lp_output_mix = self._blend_lp_output(pre_lp_out, out, struct_feat)
         aux = {
             'pre_lp_out': pre_lp_out,
             'lp_adj': lp_adj,
             'edge_index': lp_edge_index,
             'alpha': lp_alpha,
             'prop_alpha': lp_prop_alpha,
+            'lp_output_mix': lp_output_mix,
             'contrastive_embed': contrastive_embed,
         }
         return out, aux
