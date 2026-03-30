@@ -189,7 +189,7 @@ def main():
     for dataset, max_attempts in [
         ("fb_348", args.fb348_max_attempts),
         ("fb_414", args.fb414_max_attempts),
-        ("fb_698", args.fb698_max-attempts if False else args.fb698_max_attempts),
+        ("fb_698", args.fb698_max_attempts),
         ("fb_1684", args.fb1684_max_attempts),
         ("mag_cs", args.magcs_max_attempts),
     ]:
