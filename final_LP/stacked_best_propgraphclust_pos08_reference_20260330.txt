@@ -1,0 +1,6 @@
+fb_348	0.391	individual	final_LP/best_propgraphclust_pos08_individual_fb348_20run_seed0.txt
+fb_414	0.568	individual	final_LP/fb414_propgraphclust_pos08_thr0510_20run_try3_20260330.txt
+fb_686	0.200	joint	final_LP/hybrid_gate_repro_propgraphclust_pos08_20run_reproduced_20260330.txt
+fb_698	0.533	individual	final_LP/best_propgraphclust_pos08_individual_fb698_20run_seed0.txt
+fb_1684	0.414	individual	final_LP/fb1684_propgraphclust_pos08_thr0510_20run_20260330.txt
+mag_cs	0.489	individual	final_LP/magcs_propgraphclust_pos08_thr0510_20run_try8_20260330.txt
