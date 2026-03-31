@@ -153,26 +153,31 @@ def run_attempt(output_path, datasets, args):
 
 
 def search_best(job_name, datasets, watched_dataset, target, max_attempts, args):
-    base_dir = RESULTS_DIR
-    best_row = None
-    best_attempt = None
-    if len(datasets) == 1:
-        print(f"Running experiment: individual {DISPLAY[watched_dataset]}", flush=True)
-    else:
-        names = ", ".join(DISPLAY.get(ds, ds) for ds in datasets)
-        print(f"Running experiment: joint [{names}]", flush=True)
-    for attempt in range(1, max_attempts + 1):
-        output_path = base_dir / f"{args.prefix}_{job_name}_try{attempt}_{args.runs}run_seed{args.seed}.txt"
-        if output_path.exists():
-            rows = parse_result_file(output_path)
-        else:
-            rows = run_attempt(output_path, datasets, args)
-        row = rows[watched_dataset]
-        if best_row is None or row["avg"] > best_row["avg"]:
-            best_row = row
-            best_attempt = attempt
+      base_dir = RESULTS_DIR
+      best_row = None
+      best_attempt = None
 
-        if len(datasets) == 1:
+      if len(datasets) == 1:
+          print(f"Running experiment: individual {DISPLAY[watched_dataset]}", flush=True)
+      else:
+          names = ", ".join(DISPLAY.get(ds, ds) for ds in datasets)
+          print(f"Running experiment: joint [{names}]", flush=True)
+
+      for attempt in range(1, max_attempts + 1):
+          output_path = base_dir / f"{args.prefix}_{job_name}_try{attempt}_{args.runs}run_seed{args.seed}.txt"
+
+          if output_path.exists():
+              rows = parse_result_file(output_path)
+          else:
+              rows = run_attempt(output_path, datasets, args)
+
+          row = rows[watched_dataset]
+
+          if best_row is None or row["avg"] > best_row["avg"]:
+              best_row = row
+              best_attempt = attempt
+
+          if len(datasets) == 1:
               print(
                   f"Attempt {attempt}/{max_attempts} finished: 20-run avg = {row['avg']:.3f}",
                   flush=True,
@@ -183,23 +188,25 @@ def search_best(job_name, datasets, watched_dataset, target, max_attempts, args)
                   f"{DISPLAY[watched_dataset]} 20-run avg = {row['avg']:.3f}",
                   flush=True,
               )
-              
-        if row["avg"] >= target:
+
+          if row["avg"] >= target:
               print("Target reached internally, stopping early.", flush=True)
               break
-    if len(datasets) == 1:
-        print(
-            f"Best 20-run avg for {DISPLAY[watched_dataset]}: {best_row['avg']:.3f} "
-            f"(attempt {best_attempt})",
-            flush=True,
-        )
-    else:
-        print(
-            f"Best 20-run avg for {DISPLAY[watched_dataset]} from joint experiment: "
-            f"{best_row['avg']:.3f} (attempt {best_attempt})",
-            flush=True,
-        )
-    return best_row, best_attempt
+
+      if len(datasets) == 1:
+          print(
+              f"Best 20-run avg for {DISPLAY[watched_dataset]}: {best_row['avg']:.3f} "
+              f"(attempt {best_attempt})",
+              flush=True,
+          )
+      else:
+          print(
+              f"Best 20-run avg for {DISPLAY[watched_dataset]} from joint experiment: "
+              f"{best_row['avg']:.3f} (attempt {best_attempt})",
+              flush=True,
+          )
+
+      return best_row, best_attempt
 
 
 def write_selected(path, selected):
