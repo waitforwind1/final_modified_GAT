@@ -32,7 +32,7 @@ def to_sparse_tensor(matrix: Union[sp.spmatrix, torch.Tensor],
         indices = torch.LongTensor(np.vstack([coo.row, coo.col]))
         values = torch.FloatTensor(coo.data)
         shape = torch.Size(coo.shape)
-        sparse_tensor = torch.sparse.FloatTensor(indices, values, shape)
+        sparse_tensor = torch.sparse_coo_tensor(indices, values, shape)
     elif torch.is_tensor(matrix):
         row, col = matrix.nonzero().t()
         indices = torch.stack([row, col])
