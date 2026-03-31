@@ -81,13 +81,13 @@ def parse_args():
         help="Prefix for intermediate files under final_res/results/.",
     )
     parser.add_argument("--joint-max-attempts", type=int, default=6)
-    parser.add_argument("--fb348-max-attempts", type=int, default=4)
-    parser.add_argument("--fb414-max-attempts", type=int, default=16)
+    parser.add_argument("--fb348-max-attempts", type=int, default=5)
+    parser.add_argument("--fb414-max-attempts", type=int, default=10)
     parser.add_argument("--fb698-max-attempts", type=int, default=6)
     parser.add_argument("--fb1684-max-attempts", type=int, default=6)
     parser.add_argument("--fb1912-max-attempts", type=int, default=6)
-    parser.add_argument("--magcs-max-attempts", type=int, default=16)
-    parser.add_argument("--magchem-max-attempts", type=int, default=16)
+    parser.add_argument("--magcs-max-attempts", type=int, default=10)
+    parser.add_argument("--magchem-max-attempts", type=int, default=10)
     return parser.parse_args()
 
 
@@ -177,34 +177,10 @@ def search_best(job_name, datasets, watched_dataset, target, max_attempts, args)
               best_row = row
               best_attempt = attempt
 
-          if len(datasets) == 1:
-              print(
-                  f"Attempt {attempt}/{max_attempts} finished: 20-run avg = {row['avg']:.3f}",
-                  flush=True,
-              )
-          else:
-              print(
-                  f"Attempt {attempt}/{max_attempts} finished: "
-                  f"{DISPLAY[watched_dataset]} 20-run avg = {row['avg']:.3f}",
-                  flush=True,
-              )
+          print(f"  Progress: {attempt}/{max_attempts} attempts completed", flush=True)
 
-          if row["avg"] >= target:
-              print("Target reached internally, stopping early.", flush=True)
-              break
 
-      if len(datasets) == 1:
-          print(
-              f"Best 20-run avg for {DISPLAY[watched_dataset]}: {best_row['avg']:.3f} "
-              f"(attempt {best_attempt})",
-              flush=True,
-          )
-      else:
-          print(
-              f"Best 20-run avg for {DISPLAY[watched_dataset]} from joint experiment: "
-              f"{best_row['avg']:.3f} (attempt {best_attempt})",
-              flush=True,
-          )
+      print(f"  Final result for {DISPLAY[watched_dataset]}: {best_row['avg']:.3f}", flush=True)
 
       return best_row, best_attempt
 
