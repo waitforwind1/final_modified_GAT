@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-python final_res/run_stacked_best_propgraphclust_pos08.py \
+python final_res/run_stacked_best_experiments.py \
   --device cuda \
   --runs 20 \
   --seed 0 \
