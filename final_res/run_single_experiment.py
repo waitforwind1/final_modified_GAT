@@ -852,8 +852,8 @@ def main():
         raise ValueError("Only up to 3 extra structural features are allowed beyond A and X.")
 
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
-    print(torch.__file__)
-    print(f"torch={torch.__version__}, cuda_available={torch.cuda.is_available()}")
+    # print(torch.__file__)
+    # print(f"torch={torch.__version__}, cuda_available={torch.cuda.is_available()}")
     # print(f"Hybrid target thresholds: {TARGET_TO_BEAT}")
     # print(
     #     "Enabled extra features:",
