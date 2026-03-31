@@ -171,8 +171,22 @@ def search_best(job_name, datasets, watched_dataset, target, max_attempts, args)
         if best_row is None or row["avg"] > best_row["avg"]:
             best_row = row
             best_attempt = attempt
+
+        if len(datasets) == 1:
+              print(
+                  f"Attempt {attempt}/{max_attempts} finished: 20-run avg = {row['avg']:.3f}",
+                  flush=True,
+              )
+          else:
+              print(
+                  f"Attempt {attempt}/{max_attempts} finished: "
+                  f"{DISPLAY[watched_dataset]} 20-run avg = {row['avg']:.3f}",
+                  flush=True,
+              )
+              
         if row["avg"] >= target:
-            break
+              print("Target reached internally, stopping early.", flush=True)
+              break
     if len(datasets) == 1:
         print(
             f"Best 20-run avg for {DISPLAY[watched_dataset]}: {best_row['avg']:.3f} "
