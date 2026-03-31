@@ -448,16 +448,12 @@ def run_dataset(dataset_name, device, runs, seed, output_path, dump_dir=None):
         nmi, elapsed = train_segment(adj, labels, x_norm, struct_feat, model, opt, segment_idx, device)
         values.append(nmi)
         times.append(elapsed)
-        if len(values) >= 3:
-            print(f"[{dataset_name} carry] interim avg={statistics.mean(values):.4f} std={statistics.stdev(values):.4f}")
 
     avg = statistics.mean(values)
     std = statistics.stdev(values) if len(values) > 1 else 0.0
     avg_time = statistics.mean(times)
     delta_paper = avg - PAPER[dataset_name]
     delta_target = avg - TARGET_TO_BEAT[dataset_name]
-    print(f"[{dataset_name}] paper={PAPER[dataset_name]:.4f} current={avg:.4f} delta={delta_paper:+.4f}")
-    print(f"[{dataset_name}] target={TARGET_TO_BEAT[dataset_name]:.4f} hybrid_delta={delta_target:+.4f}")
     with open(output_path, "a", encoding="utf-8") as f:
         f.write(
             f"{dataset_name}\t{avg:.3f}\t{std:.3f}\t{avg_time:.2f}\t"
@@ -858,17 +854,17 @@ def main():
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
     print(torch.__file__)
     print(f"torch={torch.__version__}, cuda_available={torch.cuda.is_available()}")
-    print(f"Hybrid target thresholds: {TARGET_TO_BEAT}")
-    print(
-        "Enabled extra features:",
-        {
-            "log_degree": CONFIG["use_log_degree"],
-            "clustering_coefficient": CONFIG["use_clustering_coefficient"],
-            "pagerank": CONFIG["use_pagerank"],
-            "avg_neighbor_degree": CONFIG["use_avg_neighbor_degree"],
-            "bridge_score": CONFIG["use_bridge_score"],
-        },
-    )
+    # print(f"Hybrid target thresholds: {TARGET_TO_BEAT}")
+    # print(
+    #     "Enabled extra features:",
+    #     {
+    #         "log_degree": CONFIG["use_log_degree"],
+    #         "clustering_coefficient": CONFIG["use_clustering_coefficient"],
+    #         "pagerank": CONFIG["use_pagerank"],
+    #         "avg_neighbor_degree": CONFIG["use_avg_neighbor_degree"],
+    #         "bridge_score": CONFIG["use_bridge_score"],
+    #     },
+    # )
     out = ROOT / args.output if not Path(args.output).is_absolute() else Path(args.output)
     dump_dir = None
     if args.dump_dir is not None:
